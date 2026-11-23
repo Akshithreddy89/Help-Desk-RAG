@@ -1,0 +1,337 @@
+"""LLM generation service using Gemini Flash with strict factual grounding and scope enforcement."""
+
+from __future__ import annotations
+
+import logging
+import re
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass, field
+from functools import lru_cache
+from typing import Any
+
+from google import genai
+from google.genai import types
+
+from app.config import settings
+from app.services.retrieval import RetrievedChunk, retrieve
+
+logger = logging.getLogger(__name__)
+
+GROUNDED_SYSTEM_INSTRUCTION = """You are a professional IT Helpdesk Assistant for our organization.
+
+Core Responsibilities:
+1. Scope Restriction: You specialize ONLY in IT helpdesk and technical support topics (such as Wi-Fi, networking, router troubleshooting, device connectivity, passwords, and IT infrastructure).
+   - If an employee asks an unrelated question outside IT helpdesk topics (e.g. general knowledge, cooking, politics, creative writing, entertainment, sports), politely decline:
+     "I am specialized only as an IT Helpdesk Assistant. I can only assist with IT, network, and technical support topics."
+2. Casual Greetings & Pleasantries: If the employee sends a casual greeting (like "Hello", "Good morning", or "How are you?"), respond warmly and professionally, and ask how you can help with their IT needs.
+3. Strict Factual Grounding: For all technical and helpdesk questions, base your answer strictly on the facts present in the provided Helpdesk Context. Do not invent steps, assume undocumented procedures, or hallucinate.
+4. Insufficient Information: If the provided Helpdesk Context does not contain enough information to answer an IT question, state:
+   "I could not find enough information in the helpdesk knowledge base to answer this question. Please contact IT support for further assistance."
+5. Source Attribution: Cite the source document name and relevant page number(s) where the information was found (e.g. "[wifi_troubleshooting.pdf, Page 1]").
+6. Clarity & Tone: Keep answers concise, clear, polite, and actionable. Use bullet points or numbered steps for troubleshooting instructions.
+"""
+
+NO_CONTEXT_FALLBACK_ANSWER = (
+    "I could not find any relevant information in the helpdesk knowledge base to answer your question. "
+    "Please contact IT support or try rephrasing your search."
+)
+
+# Fast-path pattern matchers for pure casual greetings and pleasantries
+_GREETING_RE = re.compile(
+    r"^(?:hi|hello|hey|good\s+morning|good\s+afternoon|good\s+evening|howdy|greetings)"
+    r"(?:\s+there|\s+helpdesk|\s+bot|\s+team|\s+assistant)?[!.]*$",
+    re.IGNORECASE,
+)
+_THANKS_RE = re.compile(
+    r"^(?:thank\s+you|thanks|many\s+thanks|thx|ty)(?:\s+so\s+much|\s+a\s+lot)?[\s!.]*$",
+    re.IGNORECASE,
+)
+_BYE_RE = re.compile(
+    r"^(?:bye|goodbye|see\s+you|cya|have\s+a\s+good\s+day)[\s!.]*$",
+    re.IGNORECASE,
+)
+_STATUS_RE = re.compile(
+    r"^(?:how\s+are\s+you|how's\s+it\s+going|how\s+are\s+things)[?\s!.]*$",
+    re.IGNORECASE,
+)
+_IDENTITY_RE = re.compile(
+    r"^(?:who\s+are\s+you|what\s+is\s+your\s+name|what\s+can\s+you\s+do|what\s+do\s+you\s+do)[?\s!.]*$",
+    re.IGNORECASE,
+)
+
+# 1
+def detect_casual_greeting(text: str) -> str | None:
+    """
+    Check if a user input is purely a casual greeting or pleasantry.
+
+    Returns a canned response for zero-latency, zero-token fast response,
+    or None if the query contains an actual question to be processed.
+    """
+    cleaned = text.strip()
+    if not cleaned:
+        return None
+
+    if _GREETING_RE.match(cleaned):
+        return (
+            "Hello! I am your IT Helpdesk Assistant. How can I assist you with your "
+            "Wi-Fi, network, or IT troubleshooting today?"
+        )
+    if _STATUS_RE.match(cleaned):
+        return (
+            "I'm doing well, thank you! How can I help you with your IT or "
+            "technical troubleshooting today?"
+        )
+    if _IDENTITY_RE.match(cleaned):
+        return (
+            "I am the Helpdesk RAG Assistant. I can help you troubleshoot Wi-Fi "
+            "connectivity, speed issues, router settings, and IT support topics "
+            "using our organization's knowledge base."
+        )
+    if _THANKS_RE.match(cleaned):
+        return (
+            "You're very welcome! Feel free to reach out if you need any other help "
+            "with your IT or network issues."
+        )
+    if _BYE_RE.match(cleaned):
+        return (
+            "Goodbye! Have a great day and reach out whenever you need IT assistance."
+        )
+
+    return None
+
+
+@dataclass(frozen=True)
+class GroundedSource:
+    """Attributed source document context for a generated answer."""
+
+    filename: str
+    page_numbers: list[int] = field(default_factory=list)
+    similarity: float = 0.0
+    section: str | None = None
+    page_number: int | None = None
+
+
+@dataclass(frozen=True)
+class GeneratedAnswer:
+    """Grounded answer generated by the LLM along with its verified sources."""
+
+    question: str
+    answer: str
+    sources: list[GroundedSource] = field(default_factory=list)
+    model: str = ""
+    chunk_count: int = 0
+    is_greeting: bool = False
+
+
+@lru_cache(maxsize=1)
+def get_llm_client() -> genai.Client:
+    """Create and cache the Gemini API client for text generation."""
+    api_key = settings.LLM_API_KEY
+    if not api_key:
+        raise ValueError("Neither LLM_API_KEY nor GEMINI_API_KEY is configured in .env")
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(
+            retry_options=types.HttpRetryOptions(attempts=1),
+        ),
+    )
+
+
+def format_context_blocks(chunks: Sequence[RetrievedChunk]) -> str:
+    """
+    Format retrieved knowledge chunks into an ordered, clearly delimited context block.
+
+    Includes document name, page numbers, and section question anchors for LLM citation.
+    """
+    if not chunks:
+        return ""
+
+    blocks: list[str] = []
+    for idx, chunk in enumerate(chunks, 1):
+        pages_str = (
+            ", ".join(str(p) for p in chunk.page_numbers)
+            if chunk.page_numbers
+            else str(chunk.page_number or "N/A")
+        )
+        header = f"[Source {idx}: {chunk.filename} | Page(s): {pages_str}]"
+        if chunk.question:
+            header += f"\nSection: {chunk.question}"
+        elif chunk.heading:
+            header += f"\nSection: {chunk.heading}"
+
+        blocks.append(f"{header}\n{chunk.content.strip()}")
+
+    return "\n\n---\n\n".join(blocks)
+
+
+def _deduplicate_sources(chunks: Sequence[RetrievedChunk]) -> list[GroundedSource]:
+    """Extract and deduplicate unique document/page sources from retrieved chunks."""
+    seen: set[tuple[str, str | None, int | None]] = set()
+    sources: list[GroundedSource] = []
+
+    for c in chunks:
+        sec = c.question or c.heading
+        p_num = c.page_number or (c.page_numbers[0] if c.page_numbers else None)
+        key = (c.filename, sec, p_num)
+        if key not in seen:
+            seen.add(key)
+            sources.append(
+                GroundedSource(
+                    filename=c.filename,
+                    page_numbers=list(c.page_numbers),
+                    similarity=c.similarity,
+                    section=sec,
+                    page_number=p_num,
+                )
+            )
+
+    return sources
+
+
+def generate_answer(                      # sends the chunks to llm and generate llm answer
+    question: str,
+    chunks: Sequence[RetrievedChunk],
+    *,
+    model: str | None = None,
+    temperature: float = 0.2,
+    client: genai.Client | None = None,
+) -> GeneratedAnswer:
+    """
+    Generate a factual, grounded helpdesk answer from retrieved knowledge chunks.
+
+    Handles:
+    1. Pure casual greetings with an instant canned reply (0 latency, 0 tokens).
+    2. Strict IT helpdesk scope and factual grounding with source citations.
+    3. Empty chunks fallback without unnecessary LLM API calls.
+    """
+    cleaned_question = question.strip()
+    if not cleaned_question:
+        raise ValueError("Question cannot be empty")
+
+    target_model = model or settings.LLM_MODEL
+
+    # Fast path: handle pure casual greetings immediately
+    greeting_reply = detect_casual_greeting(cleaned_question)
+    if greeting_reply is not None:
+        return GeneratedAnswer(
+            question=cleaned_question,
+            answer=greeting_reply,
+            sources=[],
+            model=target_model,
+            chunk_count=0,
+            is_greeting=True,
+        )
+
+    sources = _deduplicate_sources(chunks)
+
+    # Performance optimization: skip LLM network round-trip when no relevant context was found
+    if not chunks:
+        logger.info(
+            "No chunks provided for question: '%.50s' - returning fallback answer.",
+            cleaned_question,
+        )
+        return GeneratedAnswer(
+            question=cleaned_question,
+            answer=NO_CONTEXT_FALLBACK_ANSWER,
+            sources=[],
+            model=target_model,
+            chunk_count=0,
+            is_greeting=False,
+        )
+
+    context_text = format_context_blocks(chunks)
+    prompt = (
+        f"Context from Helpdesk Knowledge Base:\n\n"
+        f"{context_text}\n\n"
+        f"---\n\n"
+        f"Employee Question: {cleaned_question}\n\n"
+        f"Answer:"
+    )
+
+    active_client = client or get_llm_client()            #calls llm api
+    config = types.GenerateContentConfig(
+        system_instruction=GROUNDED_SYSTEM_INSTRUCTION,
+        temperature=temperature,
+        max_output_tokens=1024,
+    )
+
+    logger.info(
+        "Generating answer using model '%s' with %d context chunk(s) for question: '%.50s'",
+        target_model,
+        len(chunks),
+        cleaned_question,
+    )
+
+    started_at = time.perf_counter()
+    try:
+        response = active_client.models.generate_content(     #generate response from llm
+            model=target_model,
+            contents=prompt,
+            config=config,
+        )
+    finally:
+        logger.info(
+            "Gemini generation request finished in %.2fs (model=%s, chunks=%d).",
+            time.perf_counter() - started_at,
+            target_model,
+            len(chunks),
+        )
+
+    answer_text = (response.text or "").strip()
+    if not answer_text:
+        answer_text = NO_CONTEXT_FALLBACK_ANSWER
+
+    return GeneratedAnswer(
+        question=cleaned_question,
+        answer=answer_text,
+        sources=sources,
+        model=target_model,
+        chunk_count=len(chunks),
+        is_greeting=False,
+    )
+
+# 2
+def answer_question(
+    question: str,
+    *,
+    top_k: int = 3,
+    min_similarity: float | None = None,
+    conn: Any | None = None,
+    model: str | None = None,
+    temperature: float = 0.2,
+) -> GeneratedAnswer:
+    """
+    End-to-end RAG pipeline: handle greetings or retrieve relevant chunks and generate answer.
+
+    Fast-path: if the question is a casual greeting, returns immediately without running
+    embedding, vector search, or an LLM call.
+    """
+    cleaned_question = question.strip()
+    if not cleaned_question:
+        raise ValueError("Question cannot be empty")
+
+    # Fast path: avoid vector search & LLM call on simple greetings
+    greeting_reply = detect_casual_greeting(cleaned_question)
+    if greeting_reply is not None:
+        return GeneratedAnswer(
+            question=cleaned_question,
+            answer=greeting_reply,
+            sources=[],
+            model=model or settings.LLM_MODEL,
+            chunk_count=0,
+            is_greeting=True,
+        )
+
+    chunks = retrieve(
+        cleaned_question,
+        top_k=top_k,
+        min_similarity=min_similarity,
+        conn=conn,
+    )
+    return generate_answer(
+        cleaned_question,
+        chunks,
+        model=model,
+        temperature=temperature,
+    )
